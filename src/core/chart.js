@@ -89,18 +89,54 @@ export async function manageIndicator({ action, indicator, entity_id, inputs: in
   const inputs = inputsRaw ? (typeof inputsRaw === 'string' ? JSON.parse(inputsRaw) : inputsRaw) : undefined;
 
   if (action === 'add') {
-    const inputArr = inputs ? Object.entries(inputs).map(([k, v]) => ({ id: k, value: v })) : [];
+    // Note: TV's chart.createStudy(name, _, _, inputs) does NOT reliably apply
+    // the `inputs` argument for built-in indicators — the value is silently
+    // ignored and defaults are used instead. We add with defaults, then apply
+    // inputs via setInputValues, which is verified to work.
     const before = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
     await evaluate(`
       (function() {
         var chart = ${CHART_API};
-        chart.createStudy(${safeString(indicator)}, false, false, ${JSON.stringify(inputArr)});
+        chart.createStudy(${safeString(indicator)}, false, false);
       })()
     `);
     await new Promise(r => setTimeout(r, 1500));
     const after = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
     const newIds = (after || []).filter(id => !(before || []).includes(id));
-    return { success: newIds.length > 0, action: 'add', indicator, entity_id: newIds[0] || null, new_study_count: newIds.length };
+    const newId = newIds[0] || null;
+
+    let appliedInputs = {};
+    if (newId && inputs && typeof inputs === 'object' && Object.keys(inputs).length > 0) {
+      const result = await evaluate(`
+        (function() {
+          var chart = ${CHART_API};
+          var study = chart.getStudyById(${safeString(newId)});
+          if (!study) return { error: 'Study not found after add' };
+          var currentInputs = study.getInputValues();
+          var overrides = ${JSON.stringify(inputs)};
+          var updatedKeys = {};
+          for (var i = 0; i < currentInputs.length; i++) {
+            if (overrides.hasOwnProperty(currentInputs[i].id)) {
+              currentInputs[i].value = overrides[currentInputs[i].id];
+              updatedKeys[currentInputs[i].id] = overrides[currentInputs[i].id];
+            }
+          }
+          study.setInputValues(currentInputs);
+          return { updated_inputs: updatedKeys };
+        })()
+      `);
+      if (result && result.error) throw new Error(result.error);
+      appliedInputs = result.updated_inputs || {};
+    }
+
+    return {
+      success: newIds.length > 0,
+      action: 'add',
+      indicator,
+      entity_id: newId,
+      new_study_count: newIds.length,
+      ...(Object.keys(appliedInputs).length > 0 ? { applied_inputs: appliedInputs } : {}),
+    };
   } else if (action === 'remove') {
     if (!entity_id) throw new Error('entity_id required for remove action. Use chart_get_state to find study IDs.');
     await evaluate(`
